@@ -1,14 +1,28 @@
-/* Host-side test of hsm_session.c slot reuse (make test); crypto is stubbed to identity. */
+/* Host-side tests of hsm_session.c (make test): slot reuse, and the signed
+ * handshake end to end against the host transport through a fake daemon.
+ * Ed25519 is the firmware's (Monocypher); X25519, HKDF and AES are stubbed. */
 #include "hsm_session.h"
 #include "hsm_command.h"
+#include "hsm_keystore.h"
 #include "hsm_proto.h"
 #include "hsm_aead.h"
 #include "hsm_tamper.h"
+#include "openhsm_transport.h"
+#include <arpa/inet.h>
 #include <assert.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sodium.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 volatile uint8_t g_tamper_pending;
+static int g_tampered;
+uint16_t HSM_KeyStore_IdentitySeed(uint8_t out[32])
+{ if (g_tampered) return HSM_ERR_NOT_AUTHORIZED; memset(out, 0x42, 32); return HSM_OK; }
 void HSM_Tamper_Trip(uint8_t r) { (void)r; }
 int  HSM_Rng_Fill(uint8_t *b, size_t n) { memset(b, 7, n); return 0; }
 void HSM_X25519_PublicKey(uint8_t p[32], const uint8_t s[32]) { memcpy(p, s, 32); }
@@ -57,8 +71,79 @@ static uint16_t envelope(uint32_t sid, uint16_t inner_cmd)
     return r.status;
 }
 
+/* Fake openhsm-daemon in front of the session layer. With g_mitm set it flips
+ * a bit of the device's ephemeral key in the OPEN_SESSION reply. */
+static int g_mitm;
+static void *fake_daemon(void *arg)
+{
+    int srv = *(int *)arg;
+    for (int fd; (fd = accept(srv, NULL, NULL)) >= 0; close(fd)) {
+        uint8_t len[4], req[HSM_MAX_MSG], rsp[HSM_MAX_MSG];
+        while (recv(fd, len, 4, MSG_WAITALL) == 4) {
+            uint32_t n = (uint32_t)len[0] << 24 | (uint32_t)len[1] << 16 | (uint32_t)len[2] << 8 | len[3];
+            if (n < HSM_HEADER_SIZE || n > sizeof(req) || recv(fd, req, n, MSG_WAITALL) != (ssize_t)n) break;
+            hsm_header_t h; memcpy(&h, req, sizeof h);
+            size_t rl = h.command == HSM_CMD_OPEN_SESSION  ? HSM_Session_Open(req, n, rsp, sizeof rsp)
+                      : h.command == HSM_CMD_CLOSE_SESSION ? HSM_Session_Close(req, n, rsp, sizeof rsp)
+                      :                                      HSM_Session_Unwrap(req, n, rsp, sizeof rsp);
+            if (h.command == HSM_CMD_OPEN_SESSION && g_mitm) rsp[HSM_HEADER_SIZE] ^= 1;
+            uint8_t out[4] = { (uint8_t)(rl >> 24), (uint8_t)(rl >> 16), (uint8_t)(rl >> 8), (uint8_t)rl };
+            if (write(fd, out, 4) != 4 || write(fd, rsp, rl) != (ssize_t)rl) break;
+        }
+    }
+    return NULL;
+}
+
+/* 1 if the host transport accepts the session under the given pin (NULL = none). */
+static int host_opens(const char *pin)
+{
+    if (pin) setenv("OPENHSM_DEVICE_KEY", pin, 1); else unsetenv("OPENHSM_DEVICE_KEY");
+    ohsm_ctx *c = ohsm_open();
+    if (c) ohsm_close(c);
+    return c != NULL;
+}
+
+static void test_identity(void)
+{
+    HSM_Session_Init();
+    static int srv;
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t sl = sizeof sa;
+    assert(bind(srv, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(srv, 4) == 0);
+    assert(getsockname(srv, (struct sockaddr *)&sa, &sl) == 0);
+    char addr[32];
+    snprintf(addr, sizeof addr, "127.0.0.1:%u", ntohs(sa.sin_port));
+    setenv("OPENHSM_ADDR", addr, 1);
+    pthread_t t;
+    assert(pthread_create(&t, NULL, fake_daemon, &srv) == 0);
+
+    /* The pin is libsodium's own derivation of the identity seed. */
+    uint8_t seed[32], pk[32], sk[64];
+    char good[65], wrong[65];
+    memset(seed, 0x42, sizeof seed);
+    crypto_sign_seed_keypair(pk, sk, seed);
+    sodium_bin2hex(good, sizeof good, pk, sizeof pk);
+    memcpy(wrong, good, sizeof wrong);
+    wrong[0] = wrong[0] == '0' ? '1' : '0';
+
+    assert(host_opens(good));       /* pinned, genuine device          */
+    assert(!host_opens(wrong));     /* pinned to another device        */
+    assert(!host_opens("zz"));      /* malformed pin                   */
+    g_mitm = 1;
+    assert(!host_opens(good));      /* reply altered on the path...    */
+    assert(host_opens(NULL));       /* ...invisible without a pin      */
+    g_mitm = 0;
+    g_tampered = 1;
+    assert(!host_opens(good));      /* tamper latch: unsigned, refused */
+    assert(host_opens(NULL));
+    g_tampered = 0;
+    puts("identity: device signature verifies on the host; wrong key, MITM, tamper latch refused");
+}
+
 int main(void)
 {
+    assert(sodium_init() >= 0);
     HSM_Session_Init();
     uint32_t s1 = open_session(), s2 = open_session(), s3 = open_session(), s4 = open_session();
     assert(envelope(s2, HSM_CMD_AUTH) == HSM_OK);   /* s2 logged in */
@@ -87,5 +172,7 @@ int main(void)
     assert(envelope(a, HSM_CMD_PING) == HSM_OK);
     assert(envelope(c, HSM_CMD_PING) == HSM_OK);
     puts("session slot reuse: LRU, logged-out first — all checks pass");
+
+    test_identity();
     return 0;
 }

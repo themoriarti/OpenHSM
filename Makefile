@@ -212,10 +212,15 @@ ssh-agent:
 	cmake --build $(AGENT_BUILD) -j
 
 # --- host-side firmware tests ----------------------------------------------
-test:
+MONO := $(FW_DIR)/vendor/monocypher/src
+test: $(DEPS_SENTINEL)
 	@mkdir -p $(TEST_BUILD)
-	$(HOSTCC) -Wall -Wextra -I$(FW_DIR)/src/hsm -I$(FW_DIR)/src/crypto -o $(TEST_BUILD)/session_test \
-	    $(FW_DIR)/tests/session_test.c $(FW_DIR)/src/hsm/hsm_session.c
+	$(HOSTCC) -Wall -Wextra -I$(FW_DIR)/src/hsm -I$(FW_DIR)/src/crypto -Ihost/pkcs11 \
+	    -I$(MONO) -I$(MONO)/optional $(shell pkg-config --cflags libusb-1.0 libsodium) \
+	    -o $(TEST_BUILD)/session_test $(FW_DIR)/tests/session_test.c \
+	    $(FW_DIR)/src/hsm/hsm_session.c $(FW_DIR)/src/crypto/hsm_eddsa.c \
+	    $(MONO)/monocypher.c $(MONO)/optional/monocypher-ed25519.c host/pkcs11/openhsm_transport.c \
+	    $(shell pkg-config --libs libusb-1.0 libsodium) -lpthread
 	$(TEST_BUILD)/session_test
 
 # --- housekeeping -----------------------------------------------------------

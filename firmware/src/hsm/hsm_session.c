@@ -2,10 +2,9 @@
  * @file    hsm_session.c
  * @brief   Secure session layer for OpenHSM.
  *
- * Handshake (unauthenticated ECDH — MITM protection arrives with the device
- * certificate milestone):
+ * Handshake (ECDH, signed by the device identity key; see hsm_proto.h):
  *   host -> OPEN_SESSION { eph_pub_h, nonce_h }
- *   dev  -> { eph_pub_d, nonce_d }, header.session_id = assigned id
+ *   dev  -> { eph_pub_d, nonce_d, sig }, header.session_id = assigned id
  *   both: shared = X25519(eph_priv, peer_pub)
  *         okm    = HKDF(salt = nonce_h||nonce_d, ikm = shared, info)
  *         k_c2d  = okm[0..31]   (host->device)
@@ -23,6 +22,8 @@
 #include "hsm_hash.h"
 #include "hsm_aead.h"
 #include "hsm_tamper.h"
+#include "hsm_keystore.h"
+#include "hsm_eddsa.h"
 
 #include <string.h>
 
@@ -112,7 +113,7 @@ size_t HSM_Session_Open(const uint8_t *req, size_t req_len,
     memcpy(&hdr, req, sizeof(hdr));
     (void)req_len;
 
-    if (resp_cap < HSM_HEADER_SIZE + sizeof(hsm_open_session_t) ||
+    if (resp_cap < HSM_HEADER_SIZE + sizeof(hsm_open_session_t) + HSM_ED25519_SIG_LEN ||
         hdr.payload_length < sizeof(hsm_open_session_t)) {
         return HSM_BuildResponse(resp, req, HSM_ERR_BAD_LENGTH, 0);
     }
@@ -160,12 +161,34 @@ size_t HSM_Session_Open(const uint8_t *req, size_t req_len,
     secure_zero(shared, sizeof(shared));
     secure_zero(okm, sizeof(okm));
 
-    /* Response payload = eph_pub_d || dev_nonce; session_id in header. */
+    /* Sign the transcript with the device identity (skipped while tamper-latched).
+     * Built before resp is written, in case resp and req share a buffer. */
+    uint8_t sig[HSM_ED25519_SIG_LEN], seed[HSM_ED25519_SEED_LEN];
+    int signed_ok = (HSM_KeyStore_IdentitySeed(seed) == HSM_OK);
+    if (signed_ok) {
+        uint8_t t[HSM_ID_TRANSCRIPT_LEN], *p = t;
+        memcpy(p, HSM_ID_CONTEXT, HSM_ID_CONTEXT_LEN); p += HSM_ID_CONTEXT_LEN;
+        memcpy(p, ho->eph_pub, 32); p += 32;
+        memcpy(p, ho->nonce, 32);   p += 32;
+        memcpy(p, eph_pub, 32);     p += 32;
+        memcpy(p, dev_nonce, 32);   p += 32;
+        p[0] = (uint8_t)(s->session_id);       p[1] = (uint8_t)(s->session_id >> 8);
+        p[2] = (uint8_t)(s->session_id >> 16); p[3] = (uint8_t)(s->session_id >> 24);
+        HSM_Ed25519_Sign(seed, t, sizeof(t), sig);
+        secure_zero(seed, sizeof(seed));
+    }
+
+    /* Response payload = eph_pub_d || dev_nonce [|| sig]; session_id in header. */
     hsm_open_session_t *out = (hsm_open_session_t *)(resp + HSM_HEADER_SIZE);
     memcpy(out->eph_pub, eph_pub, 32);
     memcpy(out->nonce, dev_nonce, 32);
+    uint16_t plen = (uint16_t)sizeof(hsm_open_session_t);
+    if (signed_ok) {
+        memcpy(resp + HSM_HEADER_SIZE + plen, sig, sizeof(sig));
+        plen += HSM_ED25519_SIG_LEN;
+    }
 
-    size_t n = HSM_BuildResponse(resp, req, HSM_OK, (uint16_t)sizeof(hsm_open_session_t));
+    size_t n = HSM_BuildResponse(resp, req, HSM_OK, plen);
     /* Patch the assigned session_id into the response header (bytes 4..7). */
     resp[4] = (uint8_t)(s->session_id);
     resp[5] = (uint8_t)(s->session_id >> 8);
